@@ -189,42 +189,39 @@ fn answer(transaction: u16, body: &[u8]) -> Vec<u8> {
         body.get(2..4)
             .map(|pair| u16::from_be_bytes([pair[0], pair[1]])),
     ) else {
-        return exception(transaction, UNIT, 0, ILLEGAL_FUNCTION);
+        return exception(transaction, UNIT, 0, ILLEGAL_FUNCTION).to_vec();
     };
     match (function, address) {
-        (3, HOLDING_AT) => registers(transaction, unit, function, &[0x4248, 0x0000]),
-        (4, INPUT_AT) => registers(transaction, unit, function, &[0xFF38]),
+        (3, HOLDING_AT) => holding_reply(transaction, unit, function, [0x4248, 0x0000]).to_vec(),
+        (4, INPUT_AT) => input_reply(transaction, unit, function, [0xFF38]).to_vec(),
         // Every other function code, write function code 0x06 included: this
         // device serves reads and refuses the rest.
-        _ => exception(transaction, unit, function, ILLEGAL_FUNCTION),
+        _ => exception(transaction, unit, function, ILLEGAL_FUNCTION).to_vec(),
     }
 }
 
-/// A normal reply carrying `words`.
-fn registers(transaction: u16, unit: u8, function: u8, words: &[u16]) -> Vec<u8> {
-    let byte_count = u8::try_from(words.len() * 2).expect("this device serves short reads");
-    let mut pdu = vec![unit, function, byte_count];
-    for word in words {
-        pdu.extend_from_slice(&word.to_be_bytes());
-    }
-    frame(transaction, &pdu)
+/// Two holding words as a Modbus TCP reply. The width is the type: this
+/// device does not serve a longer holding read.
+fn holding_reply(transaction: u16, unit: u8, function: u8, words: [u16; 2]) -> [u8; 13] {
+    let [t0, t1] = transaction.to_be_bytes();
+    let [b0, b1] = words[0].to_be_bytes();
+    let [b2, b3] = words[1].to_be_bytes();
+    [t0, t1, 0, 0, 0, 7, unit, function, 4, b0, b1, b2, b3]
+}
+
+/// One input word as a Modbus TCP reply. The width is the type: this device
+/// does not serve a longer input read.
+fn input_reply(transaction: u16, unit: u8, function: u8, words: [u16; 1]) -> [u8; 11] {
+    let [t0, t1] = transaction.to_be_bytes();
+    let [hi, lo] = words[0].to_be_bytes();
+    [t0, t1, 0, 0, 0, 5, unit, function, 2, hi, lo]
 }
 
 /// A refusal, as the specification spells one: the function code with its top
-/// bit set, then the reason.
-fn exception(transaction: u16, unit: u8, function: u8, code: u8) -> Vec<u8> {
-    frame(transaction, &[unit, function | 0x80, code])
-}
-
-/// An MBAP header in front of a PDU.
-fn frame(transaction: u16, pdu: &[u8]) -> Vec<u8> {
-    let length = u16::try_from(pdu.len()).expect("this device serves short frames");
-    let mut out = Vec::with_capacity(6 + pdu.len());
-    out.extend_from_slice(&transaction.to_be_bytes());
-    out.extend_from_slice(&0_u16.to_be_bytes());
-    out.extend_from_slice(&length.to_be_bytes());
-    out.extend_from_slice(pdu);
-    out
+/// bit set, then the reason. The PDU is three bytes, so the length cannot miss.
+fn exception(transaction: u16, unit: u8, function: u8, code: u8) -> [u8; 9] {
+    let [t0, t1] = transaction.to_be_bytes();
+    [t0, t1, 0, 0, 0, 3, unit, function | 0x80, code]
 }
 
 #[cfg(test)]
@@ -235,7 +232,10 @@ mod tests {
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::{is_frame_length, TestServer, HOLDING_AT, ILLEGAL_FUNCTION, INPUT_AT, UNIT};
+    use super::{
+        exception, holding_reply, input_reply, is_frame_length, TestServer, HOLDING_AT,
+        ILLEGAL_FUNCTION, INPUT_AT, UNIT,
+    };
     use crate::frame::{MAX_LENGTH, MIN_LENGTH};
     use crate::{
         read_registers, ExceptionCode, ExchangeError, FunctionCode, ModbusError, ReadRequest,
@@ -315,6 +315,30 @@ mod tests {
         stream.read_exact(&mut reply).expect("the device answers");
 
         assert_eq!(reply, [0, 1, 0, 0, 0, 3, UNIT, 0x86, ILLEGAL_FUNCTION]);
+    }
+
+    #[test]
+    fn two_holding_words_encode_as_function_code_three() {
+        let frame = holding_reply(1, UNIT, 3, [0x4248, 0x0000]);
+
+        assert_eq!(
+            frame,
+            [0, 1, 0, 0, 0, 7, UNIT, 3, 4, 0x42, 0x48, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn one_input_word_encodes_as_function_code_four() {
+        let frame = input_reply(1, UNIT, 4, [0xFF38]);
+
+        assert_eq!(frame, [0, 1, 0, 0, 0, 5, UNIT, 4, 2, 0xFF, 0x38]);
+    }
+
+    #[test]
+    fn an_exception_is_a_three_byte_pdu() {
+        let frame = exception(1, UNIT, 3, ILLEGAL_FUNCTION);
+
+        assert_eq!(frame, [0, 1, 0, 0, 0, 3, UNIT, 0x83, ILLEGAL_FUNCTION]);
     }
 
     #[test]
