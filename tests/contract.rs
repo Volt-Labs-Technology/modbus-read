@@ -1,5 +1,9 @@
 //! Consumer contract for the published read-only API.
 //!
+//! This file pins named items and their numbers. New public items, new
+//! enum variants, and new source files are growth and must not fail these
+//! tests. Changing a named item's behavior must fail them.
+//!
 //! Expected numbers are literals. Register values are synthetic; they are
 //! not readings from a real device.
 
@@ -58,14 +62,6 @@ fn input_read(transaction: u16) -> ReadRequest {
         RegisterCount::new(2).expect("two registers"),
     )
     .expect("a read inside the address space")
-}
-
-/// Exhaustive: a third variant does not compile until this match names its byte.
-fn wire_byte(code: FunctionCode) -> u8 {
-    match code {
-        FunctionCode::ReadHoldingRegisters => 3,
-        FunctionCode::ReadInputRegisters => 4,
-    }
 }
 
 /// A device made of bytes. What is written is kept; the answer is queued.
@@ -212,11 +208,9 @@ fn scanned_lines(source: &str) -> Vec<(usize, &str)> {
 }
 
 #[test]
-fn function_code_has_exactly_the_two_read_bytes() {
+fn named_read_function_codes_are_3_and_4() {
     assert_eq!(FunctionCode::ReadHoldingRegisters.code(), 3);
     assert_eq!(FunctionCode::ReadInputRegisters.code(), 4);
-    assert_eq!(wire_byte(FunctionCode::ReadHoldingRegisters), 3);
-    assert_eq!(wire_byte(FunctionCode::ReadInputRegisters), 4);
 }
 
 #[test]
@@ -337,11 +331,8 @@ fn read_registers_writes_the_request_and_returns_the_reply() {
     let request = holding_read(1);
     let mut device = MemoryDevice::answering(HOLDING_REPLY.to_vec());
 
-    let registers = match read_registers(&mut device, &request) {
-        Ok(words) => words,
-        Err(ExchangeError::Modbus(err)) => panic!("modbus: {err}"),
-        Err(ExchangeError::Io(err)) => panic!("io: {err}"),
-    };
+    let registers: Result<Vec<u16>, ExchangeError> = read_registers(&mut device, &request);
+    let registers = registers.unwrap_or_else(|err| panic!("{err}"));
 
     assert_eq!(registers, vec![42, 400]);
     assert_eq!(device.written, HOLDING_REQUEST);

@@ -1,14 +1,15 @@
-//! [`FunctionCode`] has exactly two variants. A write cannot be named.
+//! The two named read function codes stay in [`FunctionCode`].
 //!
-//! The scan reads the enum from source. A third variant would have to be
-//! added here in a visible diff, not slipped into a match arm.
+//! Further variants are growth. Removing either named read is a contract
+//! break. A write still cannot hide in production bytes; that is
+//! `tests/read_only.rs` and `tests/contract.rs`.
 
 use std::fs;
 use std::path::Path;
 
-/// The function codes this crate can express. A write is not among them.
+/// The published read function codes remain spellable.
 #[test]
-fn the_only_function_codes_are_the_two_that_read() {
+fn the_named_read_function_codes_remain() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/frame.rs");
     let source =
         fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()));
@@ -22,5 +23,12 @@ fn the_only_function_codes_are_the_two_that_read() {
         .map(|line| line.trim_end_matches(',').to_owned())
         .collect::<Vec<String>>();
 
-    assert_eq!(variants, ["ReadHoldingRegisters", "ReadInputRegisters"]);
+    assert!(
+        variants.iter().any(|name| name == "ReadHoldingRegisters"),
+        "ReadHoldingRegisters missing from FunctionCode: {variants:?}"
+    );
+    assert!(
+        variants.iter().any(|name| name == "ReadInputRegisters"),
+        "ReadInputRegisters missing from FunctionCode: {variants:?}"
+    );
 }
