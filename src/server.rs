@@ -14,9 +14,9 @@
 //! because [`crate::FunctionCode`] cannot name one.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::frame::{MAX_LENGTH, MIN_LENGTH};
@@ -35,11 +35,12 @@ const ILLEGAL_FUNCTION: u8 = 1;
 
 /// A loopback Modbus TCP server that serves fixed synthetic registers.
 ///
-/// Drop the server to stop accepting connections. The register values are
-/// invented for tests. They are not readings from a real device.
+/// Drop the server to close live connections and stop accepting. The register
+/// values are invented for tests. They are not readings from a real device.
 pub struct TestServer {
     addr: SocketAddr,
     running: Arc<AtomicBool>,
+    connections: Arc<Mutex<Vec<TcpStream>>>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -53,7 +54,9 @@ impl TestServer {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let running = Arc::new(AtomicBool::new(true));
+        let connections = Arc::new(Mutex::new(Vec::new()));
         let flag = Arc::clone(&running);
+        let live = Arc::clone(&connections);
         let thread = thread::spawn(move || {
             while flag.load(Ordering::Relaxed) {
                 match listener.accept() {
@@ -61,7 +64,9 @@ impl TestServer {
                         if !flag.load(Ordering::Relaxed) {
                             break;
                         }
+                        remember(&live, &stream);
                         serve(stream);
+                        release(&live);
                     }
                     Err(_) => break,
                 }
@@ -70,6 +75,7 @@ impl TestServer {
         Ok(Self {
             addr,
             running,
+            connections,
             thread: Some(thread),
         })
     }
@@ -84,11 +90,47 @@ impl TestServer {
 impl Drop for TestServer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
+        shut_down_live(&self.connections);
         // Unblock `accept` so the thread can exit.
         let _ = TcpStream::connect(self.addr);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+/// A cloned handle is how Drop unblocks `read_exact` without a read timeout.
+fn remember(live: &Mutex<Vec<TcpStream>>, stream: &TcpStream) {
+    let Ok(clone) = stream.try_clone() else {
+        return;
+    };
+    let Ok(mut connections) = live.lock() else {
+        return;
+    };
+    connections.push(clone);
+}
+
+fn release(live: &Mutex<Vec<TcpStream>>) {
+    let stream = {
+        let Ok(mut connections) = live.lock() else {
+            return;
+        };
+        connections.pop()
+    };
+    if let Some(stream) = stream {
+        let _ = stream.shutdown(Shutdown::Both);
+    }
+}
+
+fn shut_down_live(live: &Mutex<Vec<TcpStream>>) {
+    let connections = {
+        let Ok(mut guard) = live.lock() else {
+            return;
+        };
+        std::mem::take(&mut *guard)
+    };
+    for stream in connections {
+        let _ = stream.shutdown(Shutdown::Both);
     }
 }
 
@@ -168,7 +210,9 @@ fn frame(transaction: u16, pdu: &[u8]) -> Vec<u8> {
 mod tests {
     use std::io::{ErrorKind, Read, Write};
     use std::net::TcpStream;
-    use std::time::Duration;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::{is_frame_length, TestServer, HOLDING_AT, ILLEGAL_FUNCTION, INPUT_AT, UNIT};
     use crate::frame::{MAX_LENGTH, MIN_LENGTH};
@@ -314,5 +358,70 @@ mod tests {
         let closed = stream.read(&mut buf);
 
         the_connection_closed_without_an_answer(closed);
+    }
+
+    fn assert_holding_float_is_fifty(stream: &mut TcpStream) {
+        let holding = request(FunctionCode::ReadHoldingRegisters, HOLDING_AT, 2);
+        let words = read_registers(stream, &holding).expect("holding registers");
+        let value = RegisterKind::F32Be.decode(&words).expect("two words");
+        assert!((Scale::one().apply(value) - 50.0).abs() < 1e-9);
+    }
+
+    fn the_peer_closed_after_drop(result: std::io::Result<usize>) {
+        match result {
+            Ok(0) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::UnexpectedEof
+                ) => {}
+            other => panic!("drop must close the live client, not answer or hang: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dropping_the_server_while_a_client_is_connected_returns() {
+        let server = TestServer::start().expect("loopback is available");
+        let addr = server.addr();
+        let mut stream = TcpStream::connect(addr).expect("the server accepts");
+        assert_holding_float_is_fifty(&mut stream);
+
+        let (done, rx) = mpsc::channel();
+        let started = Instant::now();
+        thread::spawn(move || {
+            drop(server);
+            let _ = done.send(());
+        });
+
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("dropping the test server hung while a client was connected");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "drop waited on the client: {:?}",
+            started.elapsed()
+        );
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("a test can time out a read");
+        let mut buf = [0_u8; 9];
+        the_peer_closed_after_drop(stream.read(&mut buf));
+
+        assert!(
+            TcpStream::connect(addr).is_err(),
+            "the listener must be gone after drop"
+        );
+    }
+
+    #[test]
+    fn an_idle_connected_client_is_still_served() {
+        let server = TestServer::start().expect("loopback is available");
+        let mut stream = TcpStream::connect(server.addr()).expect("the server accepts");
+        thread::sleep(Duration::from_millis(500));
+
+        assert_holding_float_is_fifty(&mut stream);
     }
 }
