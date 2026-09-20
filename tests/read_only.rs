@@ -56,6 +56,18 @@ fn count_of(line: &str, brace: char) -> i32 {
     i32::try_from(line.matches(brace).count()).unwrap_or(i32::MAX)
 }
 
+/// `.expect(` and `.unwrap(` on a production line. `unwrap_or_else` and
+/// `expect_err` are other methods; they do not contain these tokens.
+fn panic_token(line: &str) -> Option<&'static str> {
+    if line.contains(".expect(") {
+        Some(".expect(")
+    } else if line.contains(".unwrap(") {
+        Some(".unwrap(")
+    } else {
+        None
+    }
+}
+
 #[test]
 fn the_scan_cannot_pass_vacuously() {
     let files = crate_sources();
@@ -65,7 +77,7 @@ fn the_scan_cannot_pass_vacuously() {
         .map(|name| name.to_string_lossy().into_owned())
         .collect();
 
-    for expected in ["lib.rs", "frame.rs", "decode.rs"] {
+    for expected in ["lib.rs", "frame.rs", "decode.rs", "server.rs"] {
         assert!(
             names.iter().any(|name| name == expected),
             "{expected} was not among the scanned files: {names:?}"
@@ -89,6 +101,53 @@ fn the_scan_keeps_production_code_and_drops_the_rest() {
     let lines = production_lines(source);
 
     assert_eq!(lines, vec![(2, "fn kept() {}"), (8, "fn also_kept() {}")]);
+}
+
+#[test]
+fn panic_tokens_hit_production_and_ignore_the_rest() {
+    let source = concat!(
+        "fn boom() { x.expect(\"a\"); }\n",
+        "fn also() { y.unwrap(); }\n",
+        "// a line comment with .expect(\"no\") and .unwrap()\n",
+        "#[cfg(test)]\n",
+        "mod tests {\n",
+        "    fn nested() { z.expect(\"t\"); z.unwrap(); }\n",
+        "}\n",
+        "fn poison() { lock.unwrap_or_else(into_inner); }\n",
+        "fn check() { result.expect_err(\"should fail\"); }\n",
+        "fn still_kept() {}\n",
+    );
+
+    let hits: Vec<(usize, &str, &str)> = production_lines(source)
+        .into_iter()
+        .filter_map(|(number, line)| panic_token(line).map(|token| (number, line, token)))
+        .collect();
+
+    assert_eq!(
+        hits,
+        vec![
+            (1, "fn boom() { x.expect(\"a\"); }", ".expect("),
+            (2, "fn also() { y.unwrap(); }", ".unwrap("),
+        ]
+    );
+}
+
+#[test]
+fn server_production_has_no_expect_or_unwrap() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/server.rs");
+    let source = source_of(&path);
+    let hits: Vec<String> = production_lines(&source)
+        .into_iter()
+        .filter_map(|(number, line)| {
+            panic_token(line).map(|token| format!("{}:{number}: {token}\n{line}", path.display()))
+        })
+        .collect();
+
+    assert!(
+        hits.is_empty(),
+        "production expect/unwrap in src/server.rs:\n{}",
+        hits.join("\n")
+    );
 }
 
 #[test]
