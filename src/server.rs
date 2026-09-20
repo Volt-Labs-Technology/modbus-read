@@ -15,8 +15,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 
 use crate::frame::{MAX_LENGTH, MIN_LENGTH};
@@ -39,9 +38,23 @@ const ILLEGAL_FUNCTION: u8 = 1;
 /// values are invented for tests. They are not readings from a real device.
 pub struct TestServer {
     addr: SocketAddr,
-    running: Arc<AtomicBool>,
-    connections: Arc<Mutex<Vec<TcpStream>>>,
+    live: Arc<Mutex<Live>>,
     thread: Option<JoinHandle<()>>,
+}
+
+/// Running flag and sockets Drop shuts, one lock so a clone cannot appear
+/// after Drop has taken the list.
+struct Live {
+    running: bool,
+    connections: Vec<TcpStream>,
+}
+
+/// Why an accepted stream must not be served: Drop has no handle that can
+/// unblock `read_exact`.
+#[derive(Debug)]
+enum RememberError {
+    Clone,
+    Stopped,
 }
 
 impl TestServer {
@@ -53,29 +66,15 @@ impl TestServer {
     pub fn start() -> std::io::Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
-        let running = Arc::new(AtomicBool::new(true));
-        let connections = Arc::new(Mutex::new(Vec::new()));
-        let flag = Arc::clone(&running);
-        let live = Arc::clone(&connections);
-        let thread = thread::spawn(move || {
-            while flag.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        if !flag.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        remember(&live, &stream);
-                        serve(stream);
-                        release(&live);
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
+        let live = Arc::new(Mutex::new(Live {
+            running: true,
+            connections: Vec::new(),
+        }));
+        let for_thread = Arc::clone(&live);
+        let thread = thread::spawn(move || accept_loop(&listener, &for_thread));
         Ok(Self {
             addr,
-            running,
-            connections,
+            live,
             thread: Some(thread),
         })
     }
@@ -89,8 +88,7 @@ impl TestServer {
 
 impl Drop for TestServer {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
-        shut_down_live(&self.connections);
+        shut_down_live(&self.live);
         // Unblock `accept` so the thread can exit.
         let _ = TcpStream::connect(self.addr);
         if let Some(thread) = self.thread.take() {
@@ -99,35 +97,58 @@ impl Drop for TestServer {
     }
 }
 
-/// A cloned handle is how Drop unblocks `read_exact` without a read timeout.
-fn remember(live: &Mutex<Vec<TcpStream>>, stream: &TcpStream) {
-    let Ok(clone) = stream.try_clone() else {
-        return;
-    };
-    let Ok(mut connections) = live.lock() else {
-        return;
-    };
-    connections.push(clone);
+fn accept_loop(listener: &TcpListener, live: &Mutex<Live>) {
+    loop {
+        let Ok((stream, _)) = listener.accept() else {
+            break;
+        };
+        match remember(live, &stream) {
+            Ok(()) => {
+                serve(stream);
+                release(live);
+            }
+            Err(RememberError::Stopped) => {
+                let _ = stream.shutdown(Shutdown::Both);
+                break;
+            }
+            Err(RememberError::Clone) => {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        }
+    }
 }
 
-fn release(live: &Mutex<Vec<TcpStream>>) {
-    let stream = {
-        let Ok(mut connections) = live.lock() else {
-            return;
-        };
-        connections.pop()
+fn lock(live: &Mutex<Live>) -> MutexGuard<'_, Live> {
+    // A poisoned lock still holds the sockets Drop must shut.
+    live.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A cloned handle is how Drop unblocks `read_exact` without a read timeout.
+/// Failure means this stream is not in that list, so it must not be served.
+fn remember(live: &Mutex<Live>, stream: &TcpStream) -> Result<(), RememberError> {
+    let Ok(clone) = stream.try_clone() else {
+        return Err(RememberError::Clone);
     };
+    let mut guard = lock(live);
+    if !guard.running {
+        return Err(RememberError::Stopped);
+    }
+    guard.connections.push(clone);
+    Ok(())
+}
+
+fn release(live: &Mutex<Live>) {
+    let stream = lock(live).connections.pop();
     if let Some(stream) = stream {
         let _ = stream.shutdown(Shutdown::Both);
     }
 }
 
-fn shut_down_live(live: &Mutex<Vec<TcpStream>>) {
+fn shut_down_live(live: &Mutex<Live>) {
     let connections = {
-        let Ok(mut guard) = live.lock() else {
-            return;
-        };
-        std::mem::take(&mut *guard)
+        let mut guard = lock(live);
+        guard.running = false;
+        std::mem::take(&mut guard.connections)
     };
     for stream in connections {
         let _ = stream.shutdown(Shutdown::Both);
