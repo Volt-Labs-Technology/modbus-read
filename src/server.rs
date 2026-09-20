@@ -390,6 +390,38 @@ mod tests {
     }
 
     #[test]
+    fn an_mbap_length_of_one_closes_without_an_exception() {
+        let server = TestServer::start().expect("loopback is available");
+        let mut stream = TcpStream::connect(server.addr()).expect("the server accepts");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("a test can time out a read");
+        let header = header_declaring(1);
+
+        stream.write_all(&header).expect("the header is written");
+        let mut buf = [0_u8; 9];
+        let closed = stream.read(&mut buf);
+
+        the_connection_closed_without_an_answer(closed);
+    }
+
+    #[test]
+    fn an_mbap_length_of_255_closes_without_waiting_for_a_body() {
+        let server = TestServer::start().expect("loopback is available");
+        let mut stream = TcpStream::connect(server.addr()).expect("the server accepts");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("a test can time out a read");
+        let header = header_declaring(255);
+
+        stream.write_all(&header).expect("the header is written");
+        let mut buf = [0_u8; 9];
+        let closed = stream.read(&mut buf);
+
+        the_connection_closed_without_an_answer(closed);
+    }
+
+    #[test]
     fn an_mbap_length_of_65535_closes_without_waiting_for_a_body() {
         let server = TestServer::start().expect("loopback is available");
         let mut stream = TcpStream::connect(server.addr()).expect("the server accepts");
