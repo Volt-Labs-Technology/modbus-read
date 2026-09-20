@@ -19,6 +19,9 @@ thiserror = "1"
 # A loopback Modbus TCP device for tests and examples. It opens a socket.
 test-server = []
 
+[package.metadata.docs.rs]
+features = ["test-server"]
+
 [[example]]
 name = "read_two_registers"
 required-features = ["test-server"]
