@@ -19,6 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
+use crate::frame::{MAX_LENGTH, MIN_LENGTH};
+
 /// The unit id the device answers as.
 const UNIT: u8 = 1;
 
@@ -90,12 +92,21 @@ impl Drop for TestServer {
     }
 }
 
+/// The frame layer's length law, applied here so an illegal length never
+/// becomes an allocated body.
+fn is_frame_length(declared: u16) -> bool {
+    (MIN_LENGTH..=MAX_LENGTH).contains(&declared)
+}
+
 /// Answer every frame on one connection until the client goes away.
 fn serve(mut stream: TcpStream) {
     let mut header = [0_u8; 6];
     while stream.read_exact(&mut header).is_ok() {
-        let declared = usize::from(u16::from_be_bytes([header[4], header[5]]));
-        let mut body = vec![0_u8; declared];
+        let declared = u16::from_be_bytes([header[4], header[5]]);
+        if !is_frame_length(declared) {
+            return;
+        }
+        let mut body = vec![0_u8; usize::from(declared)];
         if stream.read_exact(&mut body).is_err() {
             return;
         }
@@ -155,10 +166,12 @@ fn frame(transaction: u16, pdu: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Read, Write};
+    use std::io::{ErrorKind, Read, Write};
     use std::net::TcpStream;
+    use std::time::Duration;
 
-    use super::{TestServer, HOLDING_AT, ILLEGAL_FUNCTION, INPUT_AT, UNIT};
+    use super::{is_frame_length, TestServer, HOLDING_AT, ILLEGAL_FUNCTION, INPUT_AT, UNIT};
+    use crate::frame::{MAX_LENGTH, MIN_LENGTH};
     use crate::{
         read_registers, ExceptionCode, ExchangeError, FunctionCode, ModbusError, ReadRequest,
         RegisterAddress, RegisterCount, RegisterKind, Scale, TransactionId, UnitId,
@@ -237,5 +250,69 @@ mod tests {
         stream.read_exact(&mut reply).expect("the device answers");
 
         assert_eq!(reply, [0, 1, 0, 0, 0, 3, UNIT, 0x86, ILLEGAL_FUNCTION]);
+    }
+
+    #[test]
+    fn a_frame_length_is_the_range_the_frame_layer_names() {
+        assert!(is_frame_length(MIN_LENGTH));
+        assert!(is_frame_length(MAX_LENGTH));
+        assert!(!is_frame_length(0));
+        assert!(!is_frame_length(MIN_LENGTH - 1));
+        assert!(!is_frame_length(MAX_LENGTH + 1));
+        assert!(!is_frame_length(u16::MAX));
+    }
+
+    /// Transaction 1, protocol 0, a declared length no frame can carry.
+    /// Invented bytes; not a capture from a device.
+    fn header_declaring(length: u16) -> [u8; 6] {
+        let [hi, lo] = length.to_be_bytes();
+        [0, 1, 0, 0, hi, lo]
+    }
+
+    fn the_connection_closed_without_an_answer(result: std::io::Result<usize>) {
+        match result {
+            Ok(0) => {}
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                        | ErrorKind::BrokenPipe
+                        | ErrorKind::UnexpectedEof
+                ) => {}
+            other => panic!("illegal length must close, not answer or hang: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_mbap_length_below_two_closes_without_an_exception() {
+        let server = TestServer::start().expect("loopback is available");
+        let mut stream = TcpStream::connect(server.addr()).expect("the server accepts");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("a test can time out a read");
+        let header = header_declaring(0);
+
+        stream.write_all(&header).expect("the header is written");
+        let mut buf = [0_u8; 9];
+        let closed = stream.read(&mut buf);
+
+        the_connection_closed_without_an_answer(closed);
+    }
+
+    #[test]
+    fn an_mbap_length_of_65535_closes_without_waiting_for_a_body() {
+        let server = TestServer::start().expect("loopback is available");
+        let mut stream = TcpStream::connect(server.addr()).expect("the server accepts");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("a test can time out a read");
+        let header = header_declaring(u16::MAX);
+
+        stream.write_all(&header).expect("the header is written");
+        let mut buf = [0_u8; 9];
+        let closed = stream.read(&mut buf);
+
+        the_connection_closed_without_an_answer(closed);
     }
 }
